@@ -30,6 +30,7 @@ pub enum DataKey {
     TotalShares,
     TotalStaked,
     StakingContract,
+    NFTMinter,
     VotingDelegate(Address),
     DelegatedBeneficiaries(Address),
     GlobalAccelerationPct,
@@ -108,6 +109,11 @@ impl VestingContract {
             panic!("Token already set");
         }
         env.storage().instance().set(&DataKey::Token, &token);
+    }
+
+    pub fn set_nft_minter(env: Env, minter: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::NFTMinter, &minter);
     }
 
     pub fn add_to_whitelist(env: Env, token: Address) {
@@ -213,6 +219,14 @@ impl VestingContract {
         let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
         
+        if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
+            env.invoke_contract::<()>(
+                &nft_minter,
+                &Symbol::new(&env, "mint"),
+                (&vault.owner,).into_val(&env),
+            );
+        }
+
         claim_amount
     }
 
