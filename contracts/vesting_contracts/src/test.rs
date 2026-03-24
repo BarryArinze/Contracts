@@ -1,4 +1,7 @@
 use crate::{ BatchCreateData, Milestone, PausedVault, VestingContract, VestingContractClient };
+use crate::{
+    BatchCreateData, Milestone, ScheduleConfig, VestingContract, VestingContractClient,
+};
 use soroban_sdk::{
     testutils::{ Address as _, Ledger },
     token,
@@ -203,6 +206,98 @@ fn test_pause_timestamp_locking() {
     let now = env.ledger().timestamp();
 
     let vault_id = client.create_vault_full(
+fn test_batch_add_schedules_large_tge_batch() {
+    let (env, _, client, _, _) = setup();
+    let now = env.ledger().timestamp();
+
+    let mut schedules = vec![&env];
+    for _ in 0..60 {
+        schedules.push_back(ScheduleConfig {
+            owner: Address::generate(&env),
+            amount: 10_000i128,
+            start_time: now,
+            end_time: now + 1_000,
+            keeper_fee: 0i128,
+            is_revocable: true,
+            is_transferable: false,
+            step_duration: 0u64,
+        });
+    }
+
+    let ids = client.batch_add_schedules(&schedules);
+    assert_eq!(ids.len(), 60);
+    assert_eq!(ids.get(0).unwrap(), 1u64);
+    assert_eq!(ids.get(59).unwrap(), 60u64);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient deposited tokens for batch")]
+fn test_batch_add_schedules_requires_deposited_token_coverage() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VestingContract, ());
+    let client = VestingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &1_000_000_000i128);
+
+    let token_admin = Address::generate(&env);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    client.set_token(&token_addr);
+    client.add_to_whitelist(&token_addr);
+
+    // Deliberately under-fund the contract balance relative to the batch total.
+    let stellar = token::StellarAssetClient::new(&env, &token_addr);
+    stellar.mint(&contract_id, &1_000i128);
+
+    let now = env.ledger().timestamp();
+    let schedules = vec![
+        &env,
+        ScheduleConfig {
+            owner: Address::generate(&env),
+            amount: 700i128,
+            start_time: now,
+            end_time: now + 1_000,
+            keeper_fee: 0i128,
+            is_revocable: true,
+            is_transferable: false,
+            step_duration: 0u64,
+        },
+        ScheduleConfig {
+            owner: Address::generate(&env),
+            amount: 700i128,
+            start_time: now,
+            end_time: now + 1_000,
+            keeper_fee: 0i128,
+            is_revocable: true,
+            is_transferable: false,
+            step_duration: 0u64,
+        },
+    ];
+
+    client.batch_add_schedules(&schedules);
+}
+
+#[test]
+fn test_metadata_anchor() {
+    let (env, _, client, _, _) = setup();
+
+    // Should return empty string before anything is set
+    let empty = client.get_metadata_anchor();
+    assert_eq!(empty, String::from_str(&env, ""));
+
+    // Set a CID and retrieve it
+    let cid = String::from_str(&env, "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+    client.set_metadata_anchor(&cid);
+
+    let retrieved = client.get_metadata_anchor();
+    assert_eq!(retrieved, cid);
+fn test_voting_power() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    // Irrevocable vault: 1000 tokens (100% weight = 1000 power)
+    client.create_vault_full(
         &beneficiary,
         &1000i128,
         &now,
@@ -232,6 +327,38 @@ fn test_resume_specific_schedule() {
 
     let vault_id = client.create_vault_full(
         &beneficiary,
+        &false, // is_revocable = false => is_irrevocable = true
+        &false,
+        &0u64,
+    );
+    
+    // Revocable vault: 1000 tokens (50% weight = 500 power)
+    client.create_vault_full(
+        &beneficiary,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true, // is_revocable = true => is_irrevocable = false
+        &false,
+        &0u64,
+    );
+    
+    // Total power should be 1000 + 500 = 1500
+    assert_eq!(client.get_voting_power(&beneficiary), 1500);
+}
+
+#[test]
+fn test_delegated_voting_power() {
+    let (env, _, client, _, _) = setup();
+    let beneficiary_a = Address::generate(&env);
+    let beneficiary_b = Address::generate(&env);
+    let representative = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    // A: 1000 power (irrevocable)
+    client.create_vault_full(
+        &beneficiary_a,
         &1000i128,
         &now,
         &(now + 1000),
@@ -265,6 +392,55 @@ fn test_pause_already_paused_vault() {
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
 
+        &0u64,
+    );
+    
+    // B: 500 power (revocable)
+    client.create_vault_full(
+        &beneficiary_b,
+        &1000i128,
+        &now,
+        &(now + 1000),
+        &0i128,
+        &true,
+        &false,
+        &0u64,
+    );
+    
+    // Initial check
+    assert_eq!(client.get_voting_power(&beneficiary_a), 1000);
+    assert_eq!(client.get_voting_power(&beneficiary_b), 500);
+    assert_eq!(client.get_voting_power(&representative), 0);
+    
+    // A delegates to B
+    client.delegate_voting_power(&beneficiary_a, &beneficiary_b);
+    assert_eq!(client.get_voting_power(&beneficiary_a), 0);
+    assert_eq!(client.get_voting_power(&beneficiary_b), 1500); // 500 + 1000
+    
+    // B delegates to representative
+    client.delegate_voting_power(&beneficiary_b, &representative);
+    assert_eq!(client.get_voting_power(&beneficiary_b), 0);
+    // Note: C only gets B's own power (500) because A is not a direct delegator of C in current implementation
+    // This is fine as per simple requirements.
+    assert_eq!(client.get_voting_power(&representative), 500); 
+    
+    // A redelegates to representative
+    client.delegate_voting_power(&beneficiary_a, &representative);
+    assert_eq!(client.get_voting_power(&representative), 1500); // 1000 + 500
+    
+    // A undelegates
+    client.delegate_voting_power(&beneficiary_a, &beneficiary_a);
+    assert_eq!(client.get_voting_power(&beneficiary_a), 1000);
+    assert_eq!(client.get_voting_power(&representative), 500); // Only B left
+}
+
+#[test]
+fn test_vesting_acceleration() {
+    let (env, _, client, _admin, _) = setup();
+    let beneficiary = Address::generate(&env);
+    let now = env.ledger().timestamp();
+    
+    // 1000 tokens over 1000 seconds
     let vault_id = client.create_vault_full(
         &beneficiary,
         &1000i128,
@@ -290,6 +466,39 @@ fn test_resume_non_paused_vault() {
     let beneficiary = Address::generate(&env);
     let now = env.ledger().timestamp();
 
+        &true,
+        &false,
+        &0u64,
+    );
+    
+    // Fast forward halfway to check baseline
+    env.ledger().set_timestamp(now + 250);
+    assert_eq!(client.get_claimable_amount(&vault_id), 250);
+    
+    // Accelerate by 25% (Shift = 250)
+    client.accelerate_all_schedules(&25);
+    // At T=250, effective is 500
+    assert_eq!(client.get_claimable_amount(&vault_id), 500);
+    
+    // Accelerate by 50% (Shift = 500)
+    client.accelerate_all_schedules(&50);
+    // At T=250, effective is 750
+    assert_eq!(client.get_claimable_amount(&vault_id), 750);
+    
+    // Accelerate by 100%
+    client.accelerate_all_schedules(&100);
+    assert_eq!(client.get_claimable_amount(&vault_id), 1000);
+}
+
+#[test]
+fn test_slashing() {
+    let (env, _, client, _admin, token) = setup();
+    let beneficiary = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let token_client = token::Client::new(&env, &token);
+    let now = env.ledger().timestamp();
+    
+    // 1000 tokens over 1000 seconds
     let vault_id = client.create_vault_full(
         &beneficiary,
         &1000i128,
@@ -303,4 +512,33 @@ fn test_resume_non_paused_vault() {
 
     // Try to resume without pausing first - should panic
     client.resume_specific_schedule(&vault_id);
+        &true,
+        &false,
+        &0u64,
+    );
+    
+    // Jump to T=400
+    env.ledger().set_timestamp(now + 400);
+    assert_eq!(client.get_claimable_amount(&vault_id), 400);
+    
+    // Slash!
+    client.slash_unvested_balance(&vault_id, &treasury);
+    
+    // Treasury should have received 600 (remaining unvested)
+    assert_eq!(token_client.balance(&treasury), 600);
+    
+    // Beneficiary should still have 400 vested
+    assert_eq!(client.get_claimable_amount(&vault_id), 400);
+    
+    // vault.total_amount should be 400
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.total_amount, 400);
+    
+    // Jump to T=1000, claimable should NOT increase
+    env.ledger().set_timestamp(now + 1000);
+    assert_eq!(client.get_claimable_amount(&vault_id), 400);
+    
+    // Claim 400
+    client.claim_tokens(&vault_id, &400i128);
+    assert_eq!(token_client.balance(&beneficiary), 400);
 }
