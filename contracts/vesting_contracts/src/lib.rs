@@ -543,7 +543,6 @@ impl VestingContract {
         token::Client
             ::new(&env, &token)
             .transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
-        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &vault.owner, &claim_amount);
         
         if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
             env.invoke_contract::<()>(
@@ -554,6 +553,76 @@ impl VestingContract {
         }
 
         claim_amount
+    }
+
+    pub fn batch_claim(env: Env) -> i128 {
+        Self::require_not_paused(&env);
+        let caller = env.invoker();
+        caller.require_auth();
+
+        // Get all vaults for the caller
+        let vault_ids = Self::get_user_vaults(env.clone(), caller.clone());
+        if vault_ids.is_empty() {
+            return 0;
+        }
+
+        let mut total_claimable = 0i128;
+        let mut vault_updates: Vec<(u64, Vault)> = Vec::new(&env);
+        let mut vault_ids_to_update: Vec<u64> = Vec::new(&env);
+
+        // Calculate total claimable across all vaults
+        for vault_id in vault_ids.iter() {
+            let vault = Self::get_vault_internal(&env, vault_id);
+            
+            // Skip frozen, uninitialized, or paused vaults
+            if vault.is_frozen || !vault.is_initialized {
+                continue;
+            }
+            
+            if Self::is_vault_paused(env.clone(), vault_id) {
+                continue;
+            }
+
+            let vested = Self::calculate_claimable(&env, vault_id, &vault);
+            let claimable = vested - vault.released_amount - vault.locked_amount.max(0);
+            
+            if claimable > 0 {
+                total_claimable += claimable;
+                
+                // Prepare vault update
+                let mut updated_vault = vault;
+                updated_vault.released_amount += claimable;
+                vault_updates.push_back((vault_id, updated_vault));
+                vault_ids_to_update.push_back(vault_id);
+                
+                // Heartbeat: reset Dead-Man's Switch for each vault with activity
+                update_activity(&env, vault_id);
+            }
+        }
+
+        if total_claimable <= 0 {
+            return 0;
+        }
+
+        // Update all vaults atomically
+        for (vault_id, updated_vault) in vault_updates.iter() {
+            env.storage().instance().set(&DataKey::VaultData(*vault_id), updated_vault);
+        }
+
+        // Single token transfer for the total amount
+        let token: Address = env.storage().instance().get(&DataKey::Token).expect("Token not set");
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &caller, &total_claimable);
+        
+        // Mint NFT if configured (only once for the batch claim)
+        if let Some(nft_minter) = env.storage().instance().get::<_, Address>(&DataKey::NFTMinter) {
+            env.invoke_contract::<()>(
+                &nft_minter,
+                &Symbol::new(&env, "mint"),
+                (&caller,).into_val(&env),
+            );
+        }
+
+        total_claimable
     }
 
     pub fn set_milestones(env: Env, vault_id: u64, milestones: Vec<Milestone>) {
@@ -715,6 +784,31 @@ impl VestingContract {
         let claimable = vested - vault.released_amount;
         // Subtract locked amount from claimable
         claimable - vault.locked_amount.max(0)
+    }
+
+    pub fn get_total_claimable_amount(env: Env, user: Address) -> i128 {
+        let vault_ids = Self::get_user_vaults(env.clone(), user);
+        let mut total_claimable = 0i128;
+
+        for vault_id in vault_ids.iter() {
+            let vault = Self::get_vault_internal(&env, vault_id);
+            
+            // Skip frozen, uninitialized, or paused vaults
+            if vault.is_frozen || !vault.is_initialized {
+                continue;
+            }
+            
+            if Self::is_vault_paused(env.clone(), vault_id) {
+                continue;
+            }
+
+            let claimable = Self::get_claimable_amount(env.clone(), vault_id);
+            if claimable > 0 {
+                total_claimable += claimable;
+            }
+        }
+
+        total_claimable
     }
 
     pub fn lock_tokens(env: Env, vault_id: u64, amount: i128) {
